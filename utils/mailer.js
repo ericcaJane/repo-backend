@@ -37,7 +37,7 @@ async function sendOtpEmail(to, code, title = "Your Verification Code") {
 
   try {
     await transporter.sendMail({
-      from: process.env.EMAIL_FROM,   // ✔ FIXED
+      from: process.env.EMAIL_FROM,
       to,
       subject: title,
       html: htmlTemplate,
@@ -50,6 +50,24 @@ async function sendOtpEmail(to, code, title = "Your Verification Code") {
   }
 }
 
+async function sendSystemEmail({ to, subject, text, html }) {
+  try {
+    await transporter.sendMail({
+      from: process.env.EMAIL_FROM,
+      to,
+      subject,
+      text,
+      html: html || `<p>${text}</p>`
+    });
+
+    console.log(`📧 System email sent to ${to}`);
+  } catch (err) {
+    console.error("❌ System email failed:", err);
+    throw err;
+  }
+}
+
 module.exports = {
   sendOtpEmail,
+  sendSystemEmail,
 };
