@@ -1,23 +1,15 @@
-// utils/mailer.js
 const nodemailer = require("nodemailer");
 
-// 💡 USE YOUR BREVO SMTP CREDENTIALS
 const transporter = nodemailer.createTransport({
   host: "smtp-relay.brevo.com",
   port: 587,
-  secure: false, // STARTTLS
+  secure: false,
   auth: {
-    user: process.env.BREVO_LOGIN,     // "9d4e8d001@smtp-brevo.com"
-    pass: process.env.BREVO_PASSWORD,  // "QBhGkjTyKJRnOIbU"
+    user: process.env.BREVO_LOGIN,
+    pass: process.env.BREVO_PASSWORD,
   },
 });
 
-/**
- * Send OTP email
- * @param {string} to - receiver email
- * @param {string} code - 6-digit OTP
- * @param {string} title - optional subject
- */
 async function sendOtpEmail(to, code, title = "Your Verification Code") {
   const htmlTemplate = `
     <div style="font-family: Arial, sans-serif; padding: 20px;">
@@ -45,7 +37,7 @@ async function sendOtpEmail(to, code, title = "Your Verification Code") {
 
   try {
     await transporter.sendMail({
-      from: `"Research Repository" <noreply@repo-system.com>`,
+      from: process.env.EMAIL_FROM,   // ✔ FIXED
       to,
       subject: title,
       html: htmlTemplate,
