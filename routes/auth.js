@@ -4,8 +4,9 @@ const router = express.Router();
 const User = require('../models/User');
 const bcrypt = require('bcrypt');
 const jwt = require('jsonwebtoken');
-const nodemailer = require('nodemailer');
 const { authorize } = require('../middleware/authMiddleware');
+const { sendOtpEmail } = require("../utils/mailer");
+
 
 /* =============================
    Helpers
@@ -33,47 +34,10 @@ function signAuthToken(user) {
   );
 }
 
-/* =============================
-   📧 Email Transporter (Gmail)
-============================= */
-const transporter = nodemailer.createTransport({
-  service: 'gmail',
-  auth: {
-    user: process.env.EMAIL_USER,
-    pass: process.env.EMAIL_PASS,
-  },
-  tls: { rejectUnauthorized: false },
-});
 
-transporter.verify((error) => {
-  if (error) console.error('❌ Email transporter error:', error);
-  else console.log('✅ Email transporter ready');
-});
 
-/* =============================
-   📧 One helper for all system emails
-============================= */
-function sendSystemEmail({ to, subject, text }) {
-  return transporter.sendMail({
-    from:
-      process.env.EMAIL_FROM ||
-      'Research Repo Mailer (no-reply) <no-reply@repo.msuiit.edu.ph>',
-    to,
-    subject,
-    text,
-    replyTo: process.env.REPLY_TO || 'no-reply@repo.msuiit.edu.ph',
-    headers: {
-      'Auto-Submitted': 'auto-generated',
-      'Precedence': 'bulk',
-      'X-Auto-Response-Suppress': 'All',
-    },
-    // many mailbox providers ignore this unless domain is verified
-    envelope: {
-      from: process.env.RETURN_PATH || 'bounce@repo.msuiit.edu.ph',
-      to,
-    },
-  });
-}
+
+
 
 /* =============================
    👤 Register
@@ -123,8 +87,9 @@ router.post('/register', async (req, res) => {
   }
 });
 
+
 /* =============================
-   🔐 Login (PIN-based)
+   🔐 Login (PIN-based) + OTP
 ============================= */
 router.post('/login', async (req, res) => {
   try {
@@ -141,55 +106,53 @@ router.post('/login', async (req, res) => {
     }
 
     const user = await User.findOne({ email }).select(
-      '+pinHash email role firstName lastName verified verificationCode college'
+      '+pinHash email role firstName lastName verified verificationCode college loginOtp loginOtpExpires'
     );
 
     if (!user) return res.status(404).json({ error: 'User not found' });
-    if (!user.pinHash) {
-      return res
-        .status(409)
-        .json({ error: 'Account has no PIN set. Please reset your PIN.' });
-    }
 
     const isMatch = await bcrypt.compare(rawPin, user.pinHash);
     if (!isMatch) return res.status(401).json({ error: 'Invalid PIN' });
 
-    // Not verified yet → send verification code
+    /* -------------------------------
+        Generate OTP (account verify or login)
+    --------------------------------*/
+    const otp = Math.floor(100000 + Math.random() * 900000).toString();
+
     if (!user.verified) {
-      const code = Math.floor(100000 + Math.random() * 900000).toString();
-      user.verificationCode = code;
-      await user.save();
-
-      try {
-        await sendSystemEmail({
-          to: user.email,
-          subject: 'Verify your Research Repository account',
-          text: `Your verification code is: ${code}\n\nThis is an automated message.`,
-        });
-      } catch (mailErr) {
-        console.error('❌ Send verification email failed:', mailErr);
-      }
-
-      return res.json({ needsVerification: true, email: user.email });
+      // First-time email verification OTP
+      user.verificationCode = otp;
+    } else {
+      // Regular login OTP
+      user.loginOtp = otp;
+      user.loginOtpExpires = new Date(Date.now() + 5 * 60 * 1000); // 5 min expiry
     }
 
-    const token = signAuthToken(user);
-    return res.json({
-      needsVerification: false,
-      user: {
-        id: user._id,
-        firstName: user.firstName,
-        lastName: user.lastName,
-        email: user.email,
-        role: user.role,
-        token,
-      },
-    });
+    await user.save();
+
+    /* --------------------------------
+        Send OTP Email
+    --------------------------------*/
+    try {
+      await sendOtpEmail(
+        user.email,
+        otp,
+        user.verified
+          ? "Your Login Verification Code"
+          : "Verify Your Research Repository Account"
+      );
+    } catch (mailErr) {
+      console.error("❌ OTP email failed:", mailErr);
+    }
+
+    return res.json({ needsVerification: true, email: user.email });
+
   } catch (err) {
     console.error('❌ Login error:', err);
     return res.status(500).json({ error: 'Server error' });
   }
 });
+
 
 /* =============================
    ✉️ Send PIN reset code
@@ -305,8 +268,9 @@ router.post('/reset-pin', async (req, res) => {
   }
 });
 
+
 /* =============================
-   📧 Verify login code (account verification)
+   📧 Verify Code (first-time OR login OTP)
 ============================= */
 router.post('/verify-code', async (req, res) => {
   try {
@@ -318,38 +282,76 @@ router.post('/verify-code', async (req, res) => {
     }
 
     const user = await User.findOne({ email }).select(
-      'email verified verificationCode firstName lastName role college'
+      'email verified verificationCode loginOtp loginOtpExpires firstName lastName role college'
     );
+
     if (!user) return res.status(404).json({ error: 'User not found' });
 
-    if (user.verified) return res.status(409).json({ error: 'Account already verified' });
-    if (!user.verificationCode)
-      return res.status(409).json({ error: 'No active verification code. Please request a new one.' });
-    if (user.verificationCode !== code)
-      return res.status(400).json({ error: 'Invalid verification code' });
+    /* =======================================================
+       CASE 1 — FIRST-TIME ACCOUNT EMAIL VERIFICATION
+    ======================================================== */
+    if (!user.verified) {
+      if (!user.verificationCode)
+        return res.status(400).json({ error: "No verification code found. Please login again." });
 
-    user.verified = true;
-    user.verificationCode = null;
-    user.lastVerifiedAt = new Date();
-    await user.save();
+      if (user.verificationCode !== code)
+        return res.status(400).json({ error: "Invalid verification code" });
 
-    const token = signAuthToken(user);
+      // Mark user as verified
+      user.verified = true;
+      user.verificationCode = null;
+      user.lastVerifiedAt = new Date();
+      await user.save();
+    }
+
+    /* =======================================================
+       CASE 2 — REGULAR LOGIN OTP
+    ======================================================== */
+    else {
+      if (!user.loginOtp)
+        return res.status(400).json({ error: "No login OTP found. Please login again." });
+
+      if (user.loginOtp !== code)
+        return res.status(400).json({ error: "Invalid login verification code" });
+
+      if (!user.loginOtpExpires || user.loginOtpExpires.getTime() < Date.now())
+        return res.status(400).json({ error: "Verification code expired" });
+
+      // Clear OTP after successful login
+      user.loginOtp = null;
+      user.loginOtpExpires = null;
+      await user.save();
+    }
+
+    /* =======================================================
+       Both cases → SUCCESS → Return JWT token
+    ======================================================== */
+    const token = jwt.sign(
+      { id: user._id, email: user.email, role: user.role },
+      process.env.JWT_SECRET,
+      { expiresIn: '7d' }
+    );
+
     return res.json({
-      message: 'Verification successful',
+      message: "Verification successful",
       user: {
         id: user._id,
         firstName: user.firstName,
         lastName: user.lastName,
         email: user.email,
         role: user.role,
+        college: user.college,
         token,
       },
     });
+
   } catch (err) {
-    console.error('❌ Verification error:', err);
-    return res.status(500).json({ error: 'Server error' });
+    console.error('❌ verify-code error:', err);
+    return res.status(500).json({ error: "Server error" });
   }
 });
+
+
 
 /* =============================
    🔁 Resend verification code
